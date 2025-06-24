@@ -1,17 +1,18 @@
 #!/usr/bin/python3
 
-
 import sys
 import subprocess
 import os
 import time
+import shutil
 
 # create  incul container
 # - create incul container
 # - append incul container .desktop files to host .desktop files
 def create(container_name):
     subprocess.run(["incus", "copy", "incul-template", container_name])
-    
+    shutil.copy("/etc/inculs-manager/config.sh", f"/home/{os.environ['USER']}/.config/incul-manager/{container_name}-config.sh")
+
     # detach generic network and attach new network
     subprocess.run(["incus", "network", "detach", "def", container_name])
     subprocess.run(["incus", "network", "create", f"net-{container_name}"])
@@ -22,11 +23,72 @@ def create(container_name):
     # wait for container to start
     # TODO: check for ip availability instead
     time.sleep(5)
-
+    
+    user = new_user(container_name)
+    import_ssh_keys(container_name, user)
+    
     sync()
 
     restart_panel()
 
+def new_user(container_name):
+    # Ask if the user wants a new username and password for this container
+    new_user = input("Do you want to create a new user for this container? (y/n): ").strip().lower()
+    if new_user == "y":
+        username = input("Enter the new username: ").strip()
+        password = input("Enter the new password: ").strip()
+        
+        # Update the config file with the new username and password
+        with open(f"/home/{os.environ['USER']}/.config/incul-manager/{container_name}-config.sh", "r") as file:
+            config_lines = file.readlines()
+        with open(f"/home/{os.environ['USER']}/.config/incul-manager/{container_name}-config.sh", "w") as file:
+            for line in config_lines:
+                if line.startswith("username="):
+                    file.write(f'username="{username}"\n')
+                elif line.startswith("password="):
+                    file.write(f'password="{password}"\n')
+                else:
+                    file.write(line)
+        
+        # Push the updated config file to the container and delete the default user
+        subprocess.run(["incus", "file", "push", f"/home/{os.environ['USER']}/.config/incul-manager/{container_name}-config.sh", f"{container_name}/root/config.sh"])
+        subprocess.run(["incus", "exec", container_name, "--", "chmod", "+x", "/root/config.sh"])
+        subprocess.run(["incus", "exec", container_name, "--", "/root/incul-create-user"])
+        subprocess.run(["incus", "exec", container_name, "--","sudo", "deluser", "--remove-all-file", "incul"])
+        return username
+    else:
+        print("Keeping the default user incul:incul")
+        return "incul"
+
+
+def import_ssh_keys(container_name, username):
+    ip_address = get_container_ip(container_name)
+    
+    # Create the .ssh directory and add give correct permissions to the folder
+    subprocess.run(["incus", "exec", container_name, "--", "mkdir", "-p", f"/home/{username}/.ssh"])
+    subprocess.run(["incus", "exec", container_name, "--", "chown", "-R", f"{username}:{username}", f"/home/{username}/.ssh"])
+    subprocess.run(["incus", "exec", container_name, "--", "chmod", "700", f"/home/{username}/.ssh"])
+
+    # Add the public key to the authorized_keys file    
+    subprocess.run(["ssh-copy-id", "-i", f"/home/{os.environ['USER']}/.ssh/incul-id_rsa.pub", f"{username}@{ip_address}"])
+    
+    # Remove the password info from the config file
+    with open(f"/home/{os.environ['USER']}/.config/incul-manager/{container_name}-config.sh", "r") as file:
+            config_lines = file.readlines()
+    with open(f"/home/{os.environ['USER']}/.config/incul-manager/{container_name}-config.sh", "w") as file:
+        for line in config_lines:
+            if line.startswith("password="):
+                file.write(f'password=" "\n')
+            else:
+                file.write(line)
+
+def get_container_ip(container_name):
+    result = subprocess.run(
+        f"incus list | grep {container_name} | awk -F'|' '{{split($4, a, \"(\"); print a[1]}}'",
+        shell=True,
+        stdout=subprocess.PIPE
+    )
+    return result.stdout.decode("utf-8").strip().replace(" ", "")
 
 def start(container_name):
     subprocess.run(["incus", "start", container_name])

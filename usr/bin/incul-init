@@ -25,7 +25,10 @@ sudo adduser "$CURRENT_USER" incus-admin
 mkdir -p /home/$USER/.local/share/applications
 mkdir -p /home/$USER/.local/share/desktop-directories
 mkdir -p /home/$USER/.config/menus
+mkdir -p /home/$USER/.config/incul-manager
 
+ssh-keygen -t rsa -b 4096 -C "$CURRENT_USER@incus-containers" -f "/home/$USER/.ssh/incul-id_rsa" -N ""
+echo "ssh-add /home/$USER/.ssh/incul-id_rsa > /dev/null 2>&1" >> /home/$USER/.bashrc 
 
 sudo cp -r /etc/inculs-manager/launcher-config/desktop-directories /home/$USER/.local/share/
 sudo cp /etc/inculs-manager/launcher-config/xfce-applications.menu /home/$USER/.config/menus

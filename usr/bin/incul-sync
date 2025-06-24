@@ -61,7 +61,11 @@ extract_global_inet_ip() {
 
 container_ip=$(incus info $container_name | extract_global_inet_ip)
 
-config_file="/etc/inculs-manager/config.sh"
+config_file="$HOME/.config/incul-manager/${container_name}-config.sh"
+# Check if the config file exists
+if [ ! -f "$config_file" ]; then
+	config_file="/etc/inculs-manager/config.sh"
+fi
 
 source "$config_file"
 
@@ -99,8 +103,14 @@ for file in "$folder_path"/*.desktop; do
 		# Extract arguments from existing Exec string, ignoring the exec keys %f %F %u %U %i %c %k
 		old_args=$(echo "$old_exec" | sed -E 's/(^| )%[fFuUiIcCkK]($| )//g')
 
+
+		# The template container not have an ssh key, so we need to login with password
+		if [[ "$container_name" == "incul-template" ]]; then
 		# Create the new Exec string
-		new_exec="Exec=bash -c 'xpra start ssh://$username:$password@$container_ip --title=\"${container_name^}: @title@\" --border=${colors[$index]},3 --exit-with-children --start-child=\"$old_args\"'"
+			new_exec="Exec=bash -c 'xpra start ssh://$username:$password@$container_ip --title=\"${container_name^}: @title@\" --border=${colors[$index]},3 --exit-with-children --start-child=\"$old_args\"'"
+		else
+			new_exec="Exec=bash -c 'xpra start ssh://$username@$container_ip --title=\"${container_name^}: @title@\" --border=${colors[$index]},3 --exit-with-children --start-child=\"$old_args\"'"
+		fi
 
 		# Replace the Exec string in the file
 		sed -i "s|^Exec=.*$|$new_exec|" "$file"
