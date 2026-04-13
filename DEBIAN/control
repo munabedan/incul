@@ -1,6 +1,0 @@
-Package: incul-manager
-Version: 0.1
-Architecture: all
-Maintainer: Muna Bedan <munabedan@gmail.com>
-Description: A qubes-like manager for incus containers
-Depends: python3 (>=3.11)

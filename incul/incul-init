@@ -1,0 +1,113 @@
+#!/bin/bash
+
+# Exit on error, undefined variables, and pipe failures
+set -euo pipefail
+
+# --- Configuration ---
+LOG_FILE="$HOME/incul.log"
+CURRENT_USER=$(whoami)
+
+# --- Functions ---
+
+log() {
+    echo -e "\e[1;34m[$(date +'%Y-%m-%d %H:%M:%S')]\e[0m $1"
+    echo "[$(date +'%Y-%m-%d %H:%M:%S')] $1" >> "$LOG_FILE"
+}
+
+error_exit() {
+    echo -e "\e[1;31m[ERROR]\e[0m $1" >&2
+    exit 1
+}
+
+install_xpra() {
+    # XPRA package version
+    local TARGET_VERSION="6.3.6-r0-1"
+    
+    # Add XPRA sources and GPG keys with curl
+    log "INFO" "Add XPRA sources and GPG keys"
+    sudo mkdir -p /usr/share/keyrings
+    sudo curl -sSL -o /usr/share/keyrings/xpra.asc https://xpra.org/xpra.asc
+    sudo curl -sSL -o /etc/apt/sources.list.d/xpra.sources https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/trixie/xpra.sources
+    sudo apt-get update
+
+    #  Pin all XPRA packages including common files and libraries to target version
+    log "INFO" "Creating APT pin for version $TARGET_VERSION"
+    printf "Package: xpra*\nPin: version $TARGET_VERSION\nPin-Priority: 1001\n" | sudo tee /etc/apt/preferences.d/xpra-pin > /dev/null
+
+    # Install XPRA
+    log "INFO" "Installing Xpra..."
+    sudo apt-get install -y xpra=$TARGET_VERSION
+    log "SUCCESS" "Xpra version $(xpra --version | head -n 1) installed."
+}
+
+
+setup_menus() {
+    # Create application menu directories
+    log "Setting up XFCE menu configurations..."
+    local app_dir="$HOME/.local/share/applications"
+    local desktop_dir="$HOME/.local/share/desktop-directories"
+    local menu_dir="$HOME/.config/menus"
+    mkdir -p "$app_dir" "$desktop_dir" "$menu_dir"
+
+    # Check if the default configs for the menus are available
+    if [ -d "/etc/incul/launcher-config" ]; then
+        # Copy the defaults to the menu directories
+        cp -r /etc/incul/launcher-config/desktop-directories/* "$desktop_dir/"
+        cp /etc/incul/launcher-config/xfce-applications.menu "$menu_dir/"
+    else
+        log "Warning: /etc/incul/launcher-config not found. Skipping menu copy."
+    fi
+}
+
+handle_reboot() {
+    # Request the user to reboot
+    echo -e "\n\e[1;33mIncul setup is complete.\e[0m"
+    read -p "A reboot is required to apply group changes. Reboot now? (y/N): " confirm
+    if [[ "$confirm" =~ ^[Yy]$ ]]; then
+        log "User initiated reboot."
+        sudo reboot
+    else
+        log "Reboot deferred by user."
+        echo "Please remember to reboot manually to finalize the installation."
+    fi
+}
+
+
+# --- Main Execution ---
+
+main() {
+    log "Starting Incul Initialization..."
+    
+    # check for required system utilities
+    log "Checking system dependencies..."
+    deps=("curl" "python3" "pip" "sudo" "dpkg")
+    for tool in "${deps[@]}"; do
+        if ! command -v "$tool" &>/dev/null; then
+            error_exit "Required tool '$tool' is not installed. Please install it and try again."
+        fi
+    done
+
+
+    # Run an apt source update
+    log "Updating package lists..."
+    sudo apt-get update -y
+
+    # Add current user to incus-admin group
+    log "Configuring user environment and groups..."
+    if getent group incus-admin > /dev/null; then
+        sudo usermod -aG incus-admin "$CURRENT_USER"
+    else
+        log "Warning: Group 'incus-admin' does not exist yet. Ensure Incus is installed."
+    fi
+
+    # Create the incul config directory in the current user home
+    target_dir="/home/$CURRENT_USER/.config/incul"
+    mkdir -p "$target_dir"
+
+    install_xpra
+    setup_menus
+    handle_reboot
+}
+
+# Run the main function
+main "$@"

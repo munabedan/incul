@@ -1,0 +1,193 @@
+#!/bin/bash
+
+# Exit on error and undefined vars
+set -euo pipefail
+
+# --- Configuration & Globals ---
+LOG_FILE="$HOME/incul.log"
+DEBIAN_VERSION="${DEBIAN_VERSION:-13}"
+BASE_IMAGE="images:debian/$DEBIAN_VERSION"
+SOURCE_CONFIG="/etc/incul/config.yaml"
+
+# --- Functions ---
+
+log() {
+    local level="$1"
+    local msg="$2"
+    echo -e "\e[1;33m[$(date +'%Y-%m-%d %H:%M:%S')] [$level]\e[0m $msg" | tee -a "$LOG_FILE"
+}
+
+setup_container_sources() {
+    log "INFO" "Syncing sources for $TEMPLATE_NAME..."
+
+    # Detect Host Mirror (excluding security repos)
+    local host_mirror_url
+    host_mirror_url=$(grep -E '^(deb|deb-src) http' /etc/apt/sources.list | awk '{print $2}' | grep -v "security.debian.org" | head -n 1)
+
+    # Extract apt source keys from the config file
+    local sections
+    sections=$(yq -r '.apt.sources | keys | .[]' "$SOURCE_CONFIG")
+
+    local final_sources_content=""
+
+    # Build apt sources list entries based on the config
+    # Iterate over the source file sections
+    for section in $sections; do
+
+        # extract the URL
+        local url
+        url=$(yq -r ".apt.sources.\"$section\"" "$SOURCE_CONFIG")
+
+        # Only swap URL's if it's not a security repo AND we have a host mirror
+        if [[ "$section" != *"security"* && -n "$host_mirror_url" ]]; then
+            if [[ "$url" != "$host_mirror_url" ]]; then
+                log "INFO" "Updating $section to use host mirror: $host_mirror_url"
+                url="$host_mirror_url"
+            fi
+        fi
+
+        # Bild the final sources list
+        final_sources_content+="deb $url $section main "$'\n'
+        final_sources_content+="deb-src $url $section main "$'\n\n'
+    done
+
+    # Inject into container and update
+    incus exec "$TEMPLATE_NAME" -- bash <<EOF
+        echo -e "$final_sources_content" > /etc/apt/sources.list
+        export DEBIAN_FRONTEND=noninteractive
+        apt-get update -y
+EOF
+}
+
+install_packages() {
+    # XPRA package version
+    local TARGET_VERSION="6.3.6-r0-1"
+
+    # Install curl and wget utilities in container
+    log "INFO" "Installing base utilities inside $TEMPLATE_NAME..."
+    incus exec "$TEMPLATE_NAME" -- apt-get install -y curl wget openssh-server
+
+    # To prevent script interruption by keyboard selection 
+    log "INFO" "Preseed keyboard configuration inside $TEMPLATE_NAME..."
+    incus exec "$TEMPLATE_NAME" -- sh -c "apt-get install -y debconf-utils && \
+        echo 'keyboard-configuration keyboard-configuration/layout select English (US)' | debconf-set-selections && \
+        echo 'keyboard-configuration keyboard-configuration/layout seen true' | debconf-set-selections && \
+        echo 'keyboard-configuration keyboard-configuration/modelcode string pc105' | debconf-set-selections && \
+        echo 'keyboard-configuration keyboard-configuration/modelcode seen true' | debconf-set-selections"
+
+    # Add XPRA sources and GPG keys in container with curl
+    log "INFO" "Add XPRA sources and GPG keys inside $TEMPLATE_NAME..."
+    incus exec "$TEMPLATE_NAME" -- sh -c "mkdir -p /usr/share/keyrings && \
+        curl -o /usr/share/keyrings/xpra.asc https://xpra.org/xpra.asc && \
+        curl -o /etc/apt/sources.list.d/xpra.sources https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/trixie/xpra.sources && \
+        apt-get update"
+
+    #  Pin all XPRA packages including common files and libraries to target version
+    log "INFO" "Pinning all XPRA packages to version $TARGET_VERSION..."
+    incus exec "$TEMPLATE_NAME" -- sh -c "printf 'Package: xpra*\nPin: version $TARGET_VERSION\nPin-Priority: 1001\n' > /etc/apt/preferences.d/xpra-pin"
+
+    # Install XPRA and keyboard configuration
+    log "INFO" "Installing pinned XPRA version inside $TEMPLATE_NAME..."
+    incus exec "$TEMPLATE_NAME" -- sh -c "DEBIAN_FRONTEND=noninteractive apt-get install -y \
+        xpra=$TARGET_VERSION keyboard-configuration"
+
+    # Install XFXE and supporting tools using -o Dpkg::Options to handle config file prompts silently
+    log "INFO" "Install xfce and supporting tools inside $TEMPLATE_NAME..."
+    incus exec "$TEMPLATE_NAME" -- sh -c "export DEBIAN_FRONTEND=noninteractive; apt-get install -y \
+        -o Dpkg::Options::='--force-confdef' \
+        -o Dpkg::Options::='--force-confold' \
+        thunar xfce4-terminal xfce4-notifyd xfwm4 openssh-server openssl python3-numpy"
+
+    # Check installed xpra version
+    log "INFO" "Verification: Checking Xpra version..."
+    incus exec "$TEMPLATE_NAME" -- xpra --version
+}
+
+create_user() {
+    log "INFO" "Finalizing user setup with SSH keys and password hash..."
+
+    # Check source config
+    if [[ ! -f "$SOURCE_CONFIG" ]]; then
+        log "ERROR" "Config file not found at $SOURCE_CONFIG"
+        return 1
+    fi
+
+    # Extract user authentication values using yq 
+    local username=$(yq -r '.auth.username' "$SOURCE_CONFIG")
+    local password_hash=$(yq -r '.auth.password' "$SOURCE_CONFIG")
+    
+    # Define key path based on template name
+    local key_dir="$HOME/.ssh/incus_keys"
+    local key_path="$key_dir/${TEMPLATE_NAME}_key"
+    mkdir -p "$key_dir"
+
+    # Create the SSH key if it doesn't exist
+    if [[ ! -f "$key_path" ]]; then
+        log "INFO" "Generating new SSH key: $key_path"
+        ssh-keygen -t ed25519 -N "" -f "$key_path" -C "$username@$TEMPLATE_NAME" > /dev/null
+    fi
+
+    local pub_key=$(cat "${key_path}.pub")
+
+    # Execute inside the container
+    # Pass local values to container to create the user and setup ssh 
+    incus exec "$TEMPLATE_NAME" -- env \
+        USER_NAME="$username" \
+        PASS_HASH="$password_hash" \
+        PUB_KEY="$pub_key" \
+        bash <<EOF
+        # Create user
+        adduser --disabled-password --gecos "" "\$USER_NAME"
+        usermod -aG sudo "\$USER_NAME"
+
+        # Apply password hash (using -e for encrypted)
+        echo "\$USER_NAME:\$PASS_HASH" | chpasswd -e
+
+        # Setup SSH directory
+        mkdir -p /home/\$USER_NAME/.ssh
+        echo "\$PUB_KEY" > /home/\$USER_NAME/.ssh/authorized_keys
+        
+        # Fix permissions
+        chown -R "\$USER_NAME:\$USER_NAME" /home/\$USER_NAME/.ssh
+        chmod 700 /home/\$USER_NAME/.ssh
+        chmod 600 /home/\$USER_NAME/.ssh/authorized_keys
+EOF
+
+    if [ $? -eq 0 ]; then
+        log "SUCCESS" "Build complete: $TEMPLATE_NAME"
+        log "INFO" "Private key located at: $key_path"
+    else
+        log "ERROR" "Failed to finalize user in $TEMPLATE_NAME"
+    fi
+}
+
+main() {
+
+    # Check if the template name was provided
+    if [ $# -eq 0 ]; then
+        log "ERROR" "No template name provided."
+        echo "Usage: $0 <name>"
+        exit 1
+    fi
+
+    TEMPLATE_NAME="${1}-template"
+
+
+    # Initialize incus with a basic configuration
+    log "INFO" "Initializing Incus..."
+    incus admin init --minimal
+
+
+    # Launch the container with the base image and provide it the template name
+    log "INFO" "Launching $TEMPLATE_NAME from $BASE_IMAGE..."
+    incus launch "$BASE_IMAGE" "$TEMPLATE_NAME"
+
+    # Software Installation
+    setup_container_sources
+    install_packages
+    
+    # User Setup and Cleanup
+    create_user
+}
+
+main "$@"

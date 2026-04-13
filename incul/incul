@@ -1,0 +1,496 @@
+#!/usr/bin/python3
+
+import sys
+import subprocess
+import os
+import time
+import json
+import random
+import argparse
+import json
+import logging
+import shutil
+from pathlib import Path
+
+
+class InculUtils:
+    def __init__(self):
+        self.logger = logging.getLogger("InculUtils")
+
+    def _run(self, cmd, capture_output=False, check=True):
+        """ Subprocess wrapper to run shell commands, capture output, return results, print errors and exit on command failure. """
+        try:
+            result = subprocess.run(
+                cmd, 
+                capture_output=capture_output, 
+                text=True, 
+                check=check
+            )
+            return result
+        except subprocess.CalledProcessError as e:
+            self.logger.error(f"Error executing {' '.join(cmd)}: {e}")
+            if e.stderr:
+                self.logger.debug(f"Details: {e.stderr}")
+            sys.exit(1)
+
+    def _restart_panel(self):
+        self.logger.info("Triggering XFCE panel restart...")
+        self._run(["bash", "restart-xfce4-panel"])
+
+class InculBackup:
+    def __init__(self, manager):
+        self.logger = logging.getLogger("InculBackup")
+        self.manager = manager  
+        self.backup_root = os.path.join(self.manager.home, "Incul_Backups")
+        os.makedirs(self.backup_root, exist_ok=True)
+
+    def _generate_mac(self):
+        """Generates a random MAC address to prevent network collisions."""
+        mac = [0x00, 0x16, 0x3e,
+               random.randint(0x00, 0x7f),
+               random.randint(0x00, 0xff),
+               random.randint(0x00, 0xff)]
+        return ':'.join(map(lambda x: "%02x" % x, mac))
+
+    def export_container(self, name):
+        """Creates a backup folder containing the container tarball, keys, and config."""
+        timestamp = time.strftime("%Y%m%d-%H%M%S")
+        # Create a specific folder for this backup event
+        export_folder_name = f"{name}_backup_{timestamp}"
+        export_path = os.path.join(self.backup_root, export_folder_name)
+        os.makedirs(export_path, exist_ok=True)
+
+        self.logger.info(f"Creating backup folder at {export_path}...")
+
+        # Export the Incus container into the folder
+        container_tar = os.path.join(export_path, f"{name}.tar.gz")
+        self.logger.info(f"Exporting Incus container...")
+        self.manager.utils._run(["incus", "export", name, container_tar])
+
+        # Backup SSH Keys
+        key_dir = os.path.expanduser("~/.ssh/incus_keys")
+        found_keys = False
+        for suffix in ["", ".pub"]:
+            key_file = os.path.join(key_dir, f"{name}_key{suffix}")
+            if os.path.exists(key_file):
+                shutil.copy2(key_file, export_path)
+                found_keys = True
+        
+        if found_keys:
+            self.logger.info("SSH keys backed up to folder.")
+
+        # Backup Exclusions YAML
+        config_src = os.path.join(self.manager.user_config, name, "exclusions.yaml")
+        if os.path.exists(config_src):
+            shutil.copy2(config_src, export_path)
+            self.logger.info("exclusions.yaml backed up to folder.")
+
+        self.logger.info(f"Backup of '{name}' complete.")
+
+    def import_container(self, folder_path, new_name=None):
+        """Restores from a backup folder, placing keys and configs in the right spots."""
+        if not os.path.isdir(folder_path):
+            self.logger.error(f"Backup directory not found: {folder_path}")
+            return
+
+        # Identify the original container name from the folder name
+        folder_basename = os.path.basename(folder_path.rstrip('/'))
+        original_name = folder_basename.split('_backup_')[0]
+        target_name = new_name if new_name else original_name
+
+        self.logger.info(f"Restoring {original_name} as {target_name}...")
+
+        # Import the container tarball
+        tar_files = [f for f in os.listdir(folder_path) if f.endswith(".tar.gz")]
+        if not tar_files:
+            self.logger.error("No container tarball found in the backup folder!")
+            return
+        
+        container_tar = os.path.join(folder_path, tar_files[0])
+        self.manager.utils._run(["incus", "import", container_tar, target_name])
+
+        # Restore exclusions.yaml to the correct config path
+        new_conf_dir = os.path.join(self.manager.user_config, target_name)
+        os.makedirs(new_conf_dir, exist_ok=True)
+        
+        conf_src = os.path.join(folder_path, "exclusions.yaml")
+        if os.path.exists(conf_src):
+            shutil.copy2(conf_src, os.path.join(new_conf_dir, "exclusions.yaml"))
+            self.logger.info(f"Restored exclusions.yaml to {new_conf_dir}")
+
+        # Restore SSH Keys (and rename them if the container name changed)
+        key_dest_dir = os.path.expanduser("~/.ssh/incus_keys")
+        os.makedirs(key_dest_dir, exist_ok=True)
+        
+        for suffix in ["", ".pub"]:
+            # Look for the original key name in the backup folder
+            key_src = os.path.join(folder_path, f"{original_name}_key{suffix}")
+            if os.path.exists(key_src):
+                new_key_path = os.path.join(key_dest_dir, f"{target_name}_key{suffix}")
+                shutil.copy2(key_src, new_key_path)
+                if suffix == "": # Set private key permissions
+                    os.chmod(new_key_path, 0o600)
+                self.logger.info(f"Restored SSH key: {os.path.basename(new_key_path)}")
+
+        # 4. Fix Network Conflict (Generate new MAC)
+        self.logger.info("Re-initializing network interface...")
+        
+        new_mac = self._generate_mac()
+        
+        # We use 'override' to safely handle profile-inherited devices
+        cmd = [
+            "incus", "config", "device", "override", 
+            target_name, "eth0", 
+            f"hwaddr={new_mac}"
+        ]
+        
+        try:
+            self.manager.utils._run(cmd)
+        except SystemExit:
+            # If 'override' fails (e.g., if the device is already local), 
+            # we fallback to a standard 'set'
+            self.manager.utils._run([
+                "incus", "config", "device", "set", 
+                target_name, "eth0", "hwaddr", new_mac
+            ])
+
+
+
+class InculCore:
+    def __init__(self):
+        """ Get HOME and user config paths """
+        self.logger = logging.getLogger("InculCore")
+        self.utils = InculUtils()
+        self.home = str(Path.home())
+        self.user_config = os.path.join(self.home, ".config", "incul")
+        os.makedirs(self.user_config, exist_ok=True)
+
+    def init(self):
+        self.logger.info("Initializing Incul environment...")
+        self.utils._run(["bash", "incul-init"])
+
+    def create_template(self, template_name):
+        self.logger.info(f"Creating template: {template_name}")
+        self.utils._run(["bash", "incul-create-template", template_name])
+
+    def create(self, container_name, template_name):
+        """ Clones the template container provided to create a new container """
+        self.logger.info(f"Creating container '{container_name}' from template '{template_name}'...")
+
+
+        # Setup Paths for configs and ssh keys
+        template_config_path = os.path.join(self.user_config, template_name)
+        new_container_config_path = os.path.join(self.user_config, container_name)
+        template_yaml = os.path.join(template_config_path, "exclusions.yaml")
+        new_yaml = os.path.join(new_container_config_path, "exclusions.yaml")
+        key_dir = os.path.expanduser("~/.ssh/incus_keys")
+        template_key = os.path.join(key_dir, f"{template_name}_key")
+        new_key = os.path.join(key_dir, f"{container_name}_key")
+        
+        # Clone the template container to create a new container
+        self.utils._run([
+            "incus", "copy", template_name, container_name, 
+            "--config", f"user.origin_template={template_name}",
+        ])
+
+        # Duplicate the SSH Key files on the Host
+        if os.path.exists(template_key):
+            try:
+                shutil.copy2(template_key, new_key)
+                shutil.copy2(f"{template_key}.pub", f"{new_key}.pub")
+                os.chmod(new_key, 0o600)
+                self.logger.info(f"SSH Keys cloned for {container_name}")
+            except Exception as e:
+                self.logger.error(f"Failed to copy keys: {e}")
+        else:
+            self.logger.warning(f"No template key found at {template_key}")
+
+        # Duplicate the Config Folder
+        if os.path.exists(template_config_path):
+            os.makedirs(new_container_config_path, exist_ok=True)
+            
+            if os.path.exists(template_yaml):
+                shutil.copy2(template_yaml, new_yaml)
+                print(f"Successfully copied exclusions.yaml to {new_yaml}")
+        else:
+            os.makedirs(new_container_config_path, exist_ok=True)
+            with open(new_yaml, 'w') as f:
+                f.write("exclusions: []")
+
+
+        # Start the new container
+        self.start(container_name)
+            
+    def start(self, container_name):
+        self.logger.info(f"Starting {container_name}")
+        self.utils._run(["incus", "start", container_name])
+
+    def pause(self, container_name):
+        self.logger.info(f"Pausing {container_name}")
+        self.utils._run(["incus", "pause", container_name])
+
+    def stop(self, container_name):
+        self.logger.info(f"Stopping {container_name}")
+        self.utils._run(["incus", "stop", container_name])
+
+    def restart(self, container_name):
+        self.logger.info(f"Restarting {container_name}")
+        self.utils._run(["incus", "restart", container_name])
+
+    def delete(self, container_name):
+        """
+        Deletes a container and removes its associated host integration files and SSH keys.
+        """
+        self.logger.info(f"Starting deletion process for: {container_name}")
+
+        # Run application files cleanup for provided container 
+        self.logger.info(f"Cleaning menu entries...")
+        self.utils._run(["bash", "incul-sync-clean", container_name])
+
+        
+        # Delete the container from incus
+        self.logger.info(f"Deleting container from Incus...")
+        self.utils._run(["incus", "delete", "--force", container_name])
+
+        # Delete container config files from host
+        config_path = os.path.expanduser(f"~/.config/incul/{container_name}")
+        if os.path.exists(config_path):
+            self.logger.info(f"Removing configuration directory: {config_path}")
+            try:
+                import shutil
+                shutil.rmtree(config_path)
+            except Exception as e:
+                self.logger.info(f"Container {container_name} successfully deleted.")
+
+        # Delete container associated ssh keys
+        key_dir = os.path.expanduser("~/.ssh/incus_keys")
+        private_key = os.path.join(key_dir, f"{container_name}_key")
+        public_key = f"{private_key}.pub"
+
+        for key_file in [private_key, public_key]:
+            if os.path.exists(key_file):
+                try:
+                    logging.info(f"Removing SSH key file: {key_file}")
+                    os.remove(key_file)
+                except Exception as e:
+                    logging.error(f"Failed to remove key file {key_file}: {e}")
+
+        # Refresh the UI to reflect the changes
+        self.utils._restart_panel()
+        self.logger.info(f"Container {container_name} successfully deleted.")
+
+    def sync(self, name=None, all_containers=False):
+        """
+        Synchronizes container applications with the host desktop.
+        If all_containers is True, syncs all running containers.
+        If name is provided, syncs only that specific container.
+        """
+        self.logger.info("Starting synchronization...")
+        
+        container_names = []
+
+        # Determine which containers to sync
+        if all_containers:
+            # Query all container names from incus
+            result = self.utils._run(
+                ["incus", "list", "status=running", "--format", "json"], 
+                capture_output=True
+            )
+            try:
+                containers = json.loads(result.stdout)
+                container_names = [c['name'] for c in containers]
+                self.logger.info(f"Found {len(container_names)} running containers for sync.")
+            except (json.JSONDecodeError, KeyError) as e:
+                self.logger.error(f"Failed to parse Incus output: {e}")
+                return
+        elif name:
+            # Add the provided container name to the sync list
+            container_names = [name]
+        else:
+            # Fallback safety check for missing arguments
+            print("Error: Please provide a container name or use --all")
+            print("\nUsage Examples:")
+            print("  incul sync <containername>")
+            print("  incul sync --all")
+            return
+
+        if not container_names:
+            self.logger.warning("No running containers found to sync.")
+            return
+
+        # Run application menu cleanup for all or the provided container
+        self.logger.info("Running pre-sync cleanup...")
+        if all_containers:
+            self.utils._run(["bash", "incul-sync-clean"])
+        else:
+            self.utils._run(["bash", "incul-sync-clean", name])
+
+        # Loop through identified containers and run the sync script
+        for container in container_names:
+            self.logger.info(f"Syncing applications for container: {container}")
+            sync_result = self.utils._run(["bash", "incul-sync", container])
+            
+            if sync_result.returncode == 0:
+                self.logger.info(f"Successfully synced {container}")
+            else:
+                self.logger.warning(f"Sync failed for {container} with exit code {sync_result.returncode}")
+
+        # Restart the UI panel to refresh the menu and icons
+        self.logger.info("Restarting desktop panel to refresh icons...")
+        self.utils._restart_panel()
+        self.logger.info("Synchronization process complete.")
+
+    def list_containers(self):
+        """
+        Prints a formatted table of containers using Incus's built-in column filtering.
+        """
+
+        column_config = "n,s,4,user.origin_template"
+        
+        result = self.utils._run(["incus", "list", "--columns", column_config])
+
+        if hasattr(result, 'stdout'):
+            output = result.stdout
+        else:
+            output = str(result)
+
+import argparse
+import sys
+
+class InculCLI:
+    def __init__(self, manager, backup):
+        self.manager = manager
+        self.backup = backup
+        
+        # Centralized examples for both Errors and Help
+        self.examples = {
+            "list":            "incul list",
+            "init":            "incul init",
+            "start":           "incul start <containername>",
+            "pause":           "incul pause <containername>",
+            "stop":            "incul stop <containername>",
+            "restart":         "incul restart <containername>",
+            "delete":          "incul delete <containername>",
+            "export":          "incul export <containername>",
+            "import":          "incul import <folder_path> [--name <new_name>]",
+            "sync":            "incul sync <containername>\n  incul sync --all",
+            "create":          "incul create <containername> <template>",
+            "create-template": "incul create-template <name>"
+        }
+
+        self.parser = argparse.ArgumentParser(
+            prog="incul",
+            description="Incul: Interface for Native Container User Layers.",
+            add_help=False  
+        )
+        self._setup_parser()
+
+    def _setup_parser(self):
+        """Initializes the parser and all subcommands with optional nargs."""
+        self.parser.add_argument("-h", "--help", action="store_true")
+        subparsers = self.parser.add_subparsers(dest="action")
+
+        # Standard actions (name argument)
+        for action in ["list", "init", "start", "pause", "stop", "restart", "delete", "export", "create-template"]:
+            p = subparsers.add_parser(action, add_help=False)
+            if action not in ["list", "init"]:
+                p.add_argument("name", nargs="?")
+
+        # Import 
+        p_import = subparsers.add_parser("import", add_help=False)
+        p_import.add_argument("folder_path", nargs="?")
+        p_import.add_argument("--name")
+        
+        # Sync
+        p_sync = subparsers.add_parser("sync", add_help=False)
+        p_sync.add_argument("name", nargs="?")
+        p_sync.add_argument("--all", action="store_true")
+
+        # Create
+        p_create = subparsers.add_parser("create", add_help=False)
+        p_create.add_argument("name", nargs="?")
+        p_create.add_argument("template", nargs="?")
+
+    def _print_custom_help(self):
+        """Prints a clean tabular help message instead of the default wall of text."""
+        print("\nIncul: Interface for Native Container User Layers.\n")
+        print("Usage: incul <action> [arguments]\n")
+        print(f"{'Action':<20} {'Example Usage'}")
+        print("-" * 60)
+        for action, example in self.examples.items():
+            summary = example.split('\n')[0]
+            print(f"{action:<20} {summary}")
+        print("\nOptions:")
+        print("  -h, --help           Show this help message and exit")
+
+    def _error_exit(self, action, message):
+        """Helper to print errors and the usage example."""
+        example = self.examples.get(action, f"incul {action}")
+        print(f"Error: {message}\n")
+        print(f"Usage Examples:\n  {example}")
+        sys.exit(1)
+
+    def run(self):
+        """Parses arguments and performs validation/dispatching."""
+        if len(sys.argv) == 1 or "-h" in sys.argv or "--help" in sys.argv:
+            self._print_custom_help()
+            sys.exit(0)
+
+        args = self.parser.parse_args()
+
+        # --- Validation Logic ---
+        if args.action in ["start", "pause", "stop", "restart", "delete", "export", "create-template"]:
+            if not args.name:
+                self._error_exit(args.action, f"Missing container name for {args.action}.")
+
+        elif args.action == "import":
+            if not args.folder_path:
+                self._error_exit(args.action, "Missing folder path for import.")
+
+        elif args.action == "sync":
+            if not args.all and not args.name:
+                self._error_exit(args.action, "Missing arguments for sync.")
+
+        elif args.action == "create":
+            if not args.name or not args.template:
+                self._error_exit(args.action, "Missing name or template for create.")
+
+        # --- Dispatching Logic ---
+        if args.action == "export":
+            self.backup.export_container(args.name)
+
+        elif args.action == "import":
+            self.backup.import_container(args.folder_path, args.name)
+
+        elif args.action == "list":
+            self.manager.list_containers()
+
+        elif args.action == "init":
+            self.manager.init()
+
+        elif args.action == "sync":
+            self.manager.sync(name=args.name, all_containers=args.all)
+
+        elif args.action == "create":
+            self.manager.create(args.name, args.template)
+
+        elif args.action == "create-template":
+            self.manager.create_template(args.name)
+
+        elif hasattr(self.manager, args.action):
+            method = getattr(self.manager, args.action)
+            method(args.name)
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO, 
+        format='%(name)s - %(levelname)s - %(message)s'
+    )
+    manager = InculCore()
+    backup = InculBackup(manager)
+
+    cli = InculCLI(manager, backup)
+    cli.run()
+
+if __name__ == "__main__":
+    main()

@@ -52,6 +52,10 @@
         <Category>System</Category>
     </Include>
 
+    <Exclude>
+        <Category>Incul</Category>
+    </Exclude>
+    
     <Layout>
         <Merge type="all"/>
     </Layout>

@@ -1,0 +1,222 @@
+#!/bin/bash
+
+# --- Definitions and Variables ---
+container_name="$1"
+user_home="/home/$USER"
+app_path="$user_home/.local/share/applications"
+menu_path="$user_home/.config/menus/xfce-applications.menu"
+dir_path="$user_home/.local/share/desktop-directories"
+config_file="/etc/incul/config.yaml"
+user_config="$user_home/.config/incul"
+
+# Load config values from config file
+if [ -f "$config_file" ]; then
+    # Load authentication details
+    username=$(yq -r '.auth.username' "$config_file")
+    
+    # Load extra arguments and environment variables
+    extra_args=$(yq -r '.xpra.extra_args // ""' "$config_file")
+    xpra_env=$(yq -r '.xpra.env // ""' "$config_file")
+else
+    echo "Error: Config file $config_file not found."
+    exit 1
+fi
+
+# Define array of colors for the window borders
+colors=(
+    "#5928ed" #purple
+    "#f57600" #brown
+    "#0073e6" #blue
+    "#356140" #green
+    "#f9ed00" #yellow
+    "#de3187" #pink
+)
+
+# Enumerate and pick a random color from the array
+num_colors=${#colors[@]}
+index=$((RANDOM % num_colors))
+random_color=${colors[$index]}
+
+
+# Define a menu entry template for the containers
+menu_content=$(cat <<EOF
+    <Menu>
+    <Name>${container_name^}</Name>
+    <Directory>$container_name.directory</Directory>
+    <Include>
+    <Category>${container_name^}</Category>
+    </Include>
+    </Menu>
+EOF
+)
+layout_content="<Menuname>${container_name^}</Menuname>"
+
+# Extract the Ip for the container 
+extract_global_inet_ip() {
+    grep 'inet:.*\(global\)' | awk '{split($2, ip, "/"); print ip[1]}'
+}
+
+
+
+echo -e "\n\e[1;33mSynchronize host menu...\e[0m"
+
+# Pull desktop entries from /usr/share/applications to the host
+incus file pull --recursive "$container_name/usr/share/applications" "$app_path"
+
+# Find all desktop entries in .local/share/applications folder and copy to the host
+for f in $(incus exec "$container_name" -- find /home -name "*.desktop" | grep ".local/share/applications"); do 
+    incus file pull "$container_name$f" "$app_path/applications/"; 
+done
+
+# Create a new applications container directory holding all the desktop entries from a specific container
+mv "$app_path/applications" "$app_path/$container_name"
+
+create_container_dir() {
+  # In the user config path, create a new directory with the container name to store container configurations
+  local target_path="$user_config/$container_name"
+  mkdir -p "$target_path"
+}
+
+process_exclusions() {
+    # Define container config directory
+    local container_dir="$app_path/$container_name"
+
+    # Define container exclusions file
+    local yaml_file="$user_config/$container_name/exclusions.yaml"
+
+    # Verify the container exclusions file
+    if [[ ! -f "$yaml_file" ]]; then
+        echo "exclusions: []" > "$yaml_file"
+    fi
+
+    # Iterate through .desktop files in the container directory
+    for desktop_file in "$container_dir"/*.desktop; do
+
+        # Check if the file referenced exists
+        [[ -e "$desktop_file" ]] || continue
+
+        # Strip the directory path and leave just the filename
+        local filename=$(basename "$desktop_file")
+
+        # Check for an entry for the filename in the exclusions file if it does not exist add one
+        if ! yq -e ".exclusions[] | select(.filename == \"$filename\")" "$yaml_file" >/dev/null 2>&1; then
+            echo "Adding new entry: $filename"
+
+            # Set the entry's hidden status to false
+            yq -i -y ".exclusions += [{\"filename\": \"$filename\", \"hidden\": false}]" "$yaml_file"
+        fi
+    done
+
+    echo "Sync complete for $yaml_file"
+}
+
+# call the functions
+create_container_dir
+process_exclusions
+
+# Create Directory Entry template for the container
+cat >>"$dir_path/$container_name.directory" <<EOF
+[Desktop Entry]
+Version=1.0
+Type=Directory
+Icon=file-manager
+Name=${container_name^}
+Comment=${container_name^} Container
+EOF
+
+
+# Use sed to insert container menu to host menu
+C=$(echo $menu_content | sed 's/\//\\\//g')
+sed -i "/<\!--Insert-container-menu-->/ s/.*/${C}\n&/" "$menu_path"
+
+# use sed to insert container layout to host menu
+C=$(echo $layout_content | sed 's/\//\\\//g')
+sed -i "/<!--Insert-container-menu-layout-->/ s/.*/${C}\n&/" "$menu_path"
+
+# Get the container IP
+container_ip=$(incus info "$container_name" | extract_global_inet_ip)
+
+# Define the path to the container applications directory
+folder_path="$app_path/$container_name"
+
+# Loop through the desktop entries in the container applications directory
+for file in "$folder_path"/*.desktop; do
+    if [ -f "$file" ]; then
+        # Remove TryExec to prevent the menu from hiding the entry if the binary isn't local
+        sed -i "/^TryExec=/d" "$file"
+        
+        # Update the Category value to be the container name
+        sed -i "/^Categories=/s/$/${container_name^};Incul;/" "$file"
+
+        # Get the Exec line and clean the placeholders 
+        old_exec=$(grep "^Exec=" "$file" | head -n1 | cut -d '=' -f2-)
+        old_args=$(echo "$old_exec" | sed -E 's/(^| )%[fFuUiIcCkK]($| )//g')
+
+
+        # Create a new exec line
+        new_exec="Exec=env $xpra_env bash -c 'xpra start ssh://$username@$container_ip --ssh=\"ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -i ~/.ssh/incus_keys/${container_name}_key\" $extra_args --title=\"${container_name^}: @title@\" --border=${colors[$index]},3 --exit-with-children --start-child=\"$old_args\"'"
+
+        # Substitute the old exec line with the new exec line in place
+        sed -i "s|^Exec=.*$|$new_exec|" "$file"
+
+        echo "Updated $file"
+    fi
+done
+
+# Loop through the desktop entries and pull missing icons
+for file in "$folder_path"/*.desktop; do
+    if [ -f "$file" ]; then
+        # Get Icon name from .desktop file
+        icon_name=$(grep "^Icon=" "$file" | cut -d '=' -f2)
+        
+        # Skip if the icon name is empty
+        [ -z "$icon_name" ] && continue
+
+        # Check if any version of this icon exists locally
+        if ! ls "$HOME/.local/share/icons/${icon_name}".* &>/dev/null; then
+            echo "Pulling icon: $icon_name"
+            
+            # Updated paths based on your container's actual file structure
+            incus file pull "$container_name/usr/share/icons/hicolor/scalable/apps/${icon_name}.svg" "$HOME/.local/share/icons/" 2>/dev/null || \
+            incus file pull "$container_name/usr/share/icons/hicolor/256x256/apps/${icon_name}.png" "$HOME/.local/share/icons/" 2>/dev/null || \
+            incus file pull "$container_name/usr/share/pixmaps/${icon_name}.png" "$HOME/.local/share/icons/" 2>/dev/null || \
+            incus file pull "$container_name/usr/share/icons/hicolor/48x48/apps/${icon_name}.png" "$HOME/.local/share/icons/" 2>/dev/null
+        fi
+    fi
+done
+
+# Define the path to the container exclusions config
+yaml_file="$user_config/$container_name/exclusions.yaml"
+
+# Loop through the .desktop files in the container applications directory
+for file in "$folder_path"/*.desktop; do
+    if [ -f "$file" ]; then
+
+        # Get the file name
+        filename=$(basename "$file")
+
+        # Check the hidden field for the given filename inside the exclusions file
+        # If no entry exists default to false
+        is_hidden=$(yq -r ".exclusions[] | select(.filename == \"$filename\") | .hidden" "$yaml_file" 2>/dev/null)
+        
+        # Default to false if the file isn't in the YAML yet
+        is_hidden=${is_hidden:-false}
+
+        
+        if [ "$is_hidden" = "true" ]; then
+            if grep -q "^Hidden=" "$file"; then
+                sed -i "s/^Hidden=.*$/Hidden=true/" "$file"
+            else
+                sed -i "/^\[Desktop Entry\]/a Hidden=true" "$file"
+            fi
+            echo "Set Hidden=true for: $filename"
+        else
+            # If the entry exists set it to false
+            if grep -q "^Hidden=" "$file"; then
+                sed -i "s/^Hidden=.*$/Hidden=false/" "$file"
+            fi
+            echo "Set Hidden=false for: $filename"
+        fi
+    fi
+done
+

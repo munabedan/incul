@@ -1,0 +1,29 @@
+incul (2.0.0)
+
+  * New Features:
+    - Replaced hardcoded password access with SSH key generation for
+      container authentication.
+    - Added backup functionality to export and restore container archives.
+    - Migrated configuration files from .sh to YAML for improved 
+      readability and parsing.
+    - Updated list command to display source templates for each container.
+    - Added per-container configuration to toggle visibility of menu entries.
+    - Added XDG force-update to refresh panels without requiring a restart.
+    - Expanded desktop entry discovery to include /usr and .local 
+      directories.
+    - Enabled icon pulling from containers via the sync script.
+    - Implemented a more robust and user-friendly CLI.
+    - Added support for inline Xpra arguments via configuration.
+
+  * Refactors and Improvements:
+    - Renamed primary binary from incul-manager to incul.
+    - Restructured directory hierarchy and created a build script for 
+      multi-OS support.
+    - Refactored create-template, incul-init, and sync scripts.
+    - Moved update sources and user creation logic to create-template script.
+
+  * Dependency Changes:
+    - Pinned xpra to version 6.3.6-r0-1.
+    - Added support for Debian 13 (Trixie).
+
+ -- Muna Bedan <munabedan@gmail.com>  Mon, 13 Apr 2026 11:30:12 +0000

@@ -1,0 +1,15 @@
+#!/bin/bash
+
+# Update the desktop database 
+update-desktop-database ~/.local/share/applications
+sudo update-desktop-database /usr/share/applications
+
+# Force Xfce's icon cache to refresh
+gtk-update-icon-cache -f -t ~/.icons 2>/dev/null
+sudo gtk-update-icon-cache -f -t /usr/share/icons/hicolor 2>/dev/null
+
+# Reload and restart Xfce Desktop and Panel
+xfdesktop --reload
+xfce4-panel --restart
+
+echo "Xfce menu and icons refreshed."

@@ -1,0 +1,14 @@
+auth:
+  username: "incul"
+  password: "$6$Y3W5XXFAOjQFHL2F$MgkiUAjZkeZxxJ4EQR8H6uQBY2/FIa6Wvrw6ZNwJaIBdX4ckCtIc.qb1nh89W0rtXYIEiUXGgxqltYGf7KPnK0"
+
+apt:
+  sources:
+    trixie: http://deb.debian.org/debian
+    trixie-security: http://deb.debian.org/debian-security/
+    trixie-updates: http://deb.debian.org/debian
+    
+
+xpra:
+  extra_args: "--dpi=96 --microphone=no"
+  env: ""

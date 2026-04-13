@@ -1,0 +1,43 @@
+#!/bin/bash
+
+
+CONTAINER_NAME=$1
+
+# If container name is NOT provided
+if [ -z "$CONTAINER_NAME" ]; then
+    echo -e "\e[1;33mClean host menu: Performing FULL cleanup...\e[0m"
+
+    # Remove all menu directories
+    rm -rf /home/$USER/.local/share/applications
+    rm -rf /home/$USER/.local/share/desktop-directories
+    rm -rf /home/$USER/.config/menus
+
+    # Recreate all the menu directories
+    mkdir -p /home/$USER/.local/share/applications
+    mkdir -p /home/$USER/.local/share/desktop-directories
+    mkdir -p /home/$USER/.config/menus
+
+    # Copy the default incul menu files to user menu directory
+    sudo cp -r /etc/incul/launcher-config/desktop-directories /home/$USER/.local/share/
+    sudo cp /etc/incul/launcher-config/xfce-applications.menu /home/$USER/.config/menus
+
+# Container name is provided
+else
+    echo -e "\e[1;33mClean host menu: Cleaning specific container [$CONTAINER_NAME]...\e[0m"
+
+    # Remove the container's application and desktop directories
+    rm -rf "/home/$USER/.local/share/applications/$CONTAINER_NAME"
+    rm -f "/home/$USER/.local/share/desktop-directories/$CONTAINER_NAME.directory"
+
+    # 3. Remove the container entry from the menu XML file
+    MENU_FILE="/home/$USER/.config/menus/xfce-applications.menu"
+    if [ -f "$MENU_FILE" ]; then
+        sed -i "/<Menuname>${CONTAINER_NAME^}<\/Menuname>/d" "$MENU_FILE"
+        sed -i "/<Menu>/{:a;N;/<\/Menu>/!ba;/<Name>$CONTAINER_NAME<\/Name>/d}" "$MENU_FILE"
+    fi
+fi
+
+# Ensure correct ownership of the home files
+sudo chown -R $USER:$USER /home/$USER/.local/share/applications
+sudo chown -R $USER:$USER /home/$USER/.local/share/desktop-directories
+sudo chown -R $USER:$USER /home/$USER/.config/menus
