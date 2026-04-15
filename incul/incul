@@ -380,7 +380,7 @@ class InculCLI:
 
         self.parser = argparse.ArgumentParser(
             prog="incul",
-            description="Incul: Interface for Native Container User Layers.",
+            description="Incul: Lightweight container-based desktop compartmentalization.",
             add_help=False  
         )
         self._setup_parser()

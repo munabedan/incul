@@ -2,7 +2,7 @@ Package: incul
 Version: 2.0.0
 Architecture: all
 Maintainer: Muna Bedan <munabedan@gmail.com>
-Description: Lightweight container-based digital compartmentalization
+Description: Lightweight container-based desktop compartmentalization.
   Incul uses Incus and Xpra under the hood to let you run separate,
   isolated environments for everyday tasks without the overhead of full 
   virtual machines. You can keep different applications, projects, or 
