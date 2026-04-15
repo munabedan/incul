@@ -44,7 +44,7 @@ Using **Xpra**, graphical applications inside containers are rendered seamlessly
     ```bash
     incul create-template debian
     ```
-    ![Create Template](screenshots/running_incul_init_to_initialize_the_system.png)
+    ![Create Template](screenshots/create_a_debian_template.png)
 
     *Note: Incul generates a config for each container in `~/.config/<container_name>`. Use the `exclusions.yaml` file 
     to hide or show specific menu entries on the host.*
