@@ -27,3 +27,11 @@ incul (2.0.0)
     - Added support for Debian 13 (Trixie).
 
  -- Muna Bedan <munabedan@gmail.com>  Mon, 13 Apr 2026 11:30:12 +0000
+
+incul (2.0.1)
+
+  * Bug fix: 
+    - updated sync to clean .desktop entries with sed to only keep required fields 
+      to avoid cluttering the host Open With context menu.
+
+ -- Muna Bedan <munabedan@gmail.com>  Wed, 06 May 2026 11:54:00 +0300
