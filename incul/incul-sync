@@ -142,11 +142,27 @@ folder_path="$app_path/$container_name"
 # Loop through the desktop entries in the container applications directory
 for file in "$folder_path"/*.desktop; do
     if [ -f "$file" ]; then
+        # Keep only the desired keys
+        sed -i -n "
+            1i[Desktop Entry]
+            /^Name=/p
+            /^Comment=/p
+            /^Exec=/p
+            /^Icon=/p
+            /^Terminal=/p
+            /^Type=/p
+            /^Categories=/p
+            /^Keywords=/p
+        " "$file"
+
         # Remove TryExec to prevent the menu from hiding the entry if the binary isn't local
         sed -i "/^TryExec=/d" "$file"
         
         # Update the Category value to be the container name
         sed -i "/^Categories=/s/$/${container_name^};Incul;/" "$file"
+
+        # Normalize Categories to only container + Incul
+        sed -i "s|^Categories=.*$|Categories=${container_name^};Incul;|" "$file"
 
         # Get the Exec line and clean the placeholders 
         old_exec=$(grep "^Exec=" "$file" | head -n1 | cut -d '=' -f2-)
